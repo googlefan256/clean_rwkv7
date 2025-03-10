@@ -1,9 +1,11 @@
 import math
-from typing import Optional
+from typing import Optional, Tuple
 import torch
 from torch import nn
 from torch.nn import functional as F
 from .rwkv7_wind import load_cuda_rwkv7_g
+from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
+import deepspeed
 
 
 class RWKV7TMix(nn.Module):
@@ -109,7 +111,9 @@ class RWKV7TMix(nn.Module):
             # self.receptance.weight.data.uniform_(-0.5/(C**0.5), 0.5/(C**0.5))
             # self.key.weight.data.uniform_(-0.05/(C**0.5), 0.05/(C**0.5))
             # self.value.weight.data.uniform_(-0.5/(C**0.5), 0.5/(C**0.5))
-            # self.output.weight.data.zero_()
+            self.output.weight.data.zero_()
+            layer_scale = (1 + layer_id) / n_layer
+            self.ln_x.weight = (self.ln_x.weight * 0.0) + (layer_scale**0.7)
 
     def forward(self, x: torch.Tensor, v_first: torch.Tensor):
         B, T, C = x.size()
@@ -174,8 +178,8 @@ class RWKV7CMix(nn.Module):
         self.value = nn.Linear(n_embd * 4, n_embd, bias=False)
 
         # !!! initialize if you are using RWKV_Tmix_x070 in your code !!!
-        # self.key.weight.data.uniform_(-0.5/(args.n_embd**0.5), 0.5/(args.n_embd**0.5))
-        # self.value.weight.data.zero_()
+        # self.key.weight.data.uniform_(-0.5/(n_embd**0.5), 0.5/(n_embd**0.5))
+        nn.init.zeros_(self.value.weight)
 
     def forward(self, x: torch.Tensor):
         xx = self.time_shift(x) - x
@@ -274,19 +278,35 @@ class RWKV(nn.Module):
         self.ln_out = nn.LayerNorm(n_embd)
         self.head = nn.Linear(n_embd, vocab_size, bias=False)
         self.vocab_size = vocab_size
-        self.n_embd = n_embd
         self.head_qk = head_qk
         if head_qk > 0:
             self.head_q = nn.Linear(n_embd, head_qk, bias=False)
+            nn.init.zeros_(self.head_q.weight)
             self.head_k = nn.Linear(n_embd, head_qk, bias=False)
+            nn.init.uniform_(self.head_q.weight, a=-0.1, b=0.1)
             self.register_buffer("copy_mask", torch.tril(torch.ones(ctx_len, ctx_len)))
         if dropout > 0:
             self.drop0 = nn.Dropout(p=dropout)
         else:
             self.drop0 = None
         self.ctx_len = ctx_len
+        nn.init.uniform_(self.emb.weight, a=-1e-4, b=1e-4)
+        if vocab_size > n_embd:
+            scale = 0.5 * math.sqrt(vocab_size / n_embd)
+        else:
+            scale = 0.5
+        nn.init.orthogonal_(self.head.weight, gain=scale)
 
-    def configure_optimizers(self):
+    def create_optimizers(
+        self,
+        weight_decay: float,
+        ft: bool,
+        cpu_adam: bool,
+        lr_init: float,
+        betas: Tuple[float, float],
+        adam_eps: float,
+        layerwise_lr=True,
+    ):
 
         lr_decay = set()
         lr_1x = set()
@@ -294,38 +314,14 @@ class RWKV(nn.Module):
         lr_3x = set()
         for n, p in self.named_parameters():
 
-            # if not p.requires_grad:
-            #     continue
-            if args.train_type == "states":
-                if "time_sta" not in n:
-                    continue
-
-            if (("_w1" in n) or ("_w2" in n)) and (args.layerwise_lr > 0):
-                lr_1x.add(n)
-            elif ("time_sta" in n) and (args.weight_decay > 0):
-                lr_decay.add(n)
-            elif (("time_mix" in n) or ("time_maa" in n)) and (args.layerwise_lr > 0):
-                if args.my_pile_stage == 2:
-                    lr_2x.add(n)
-                else:
-                    lr_1x.add(n)
-            elif (("time_decay" in n) or ("time_daaaa" in n) or ("att.w0" in n)) and (
-                args.layerwise_lr > 0
-            ):
-                if args.my_pile_stage == 2:
+            if ("att.w0" in n) and layerwise_lr:
+                if ft:
                     lr_3x.add(n)
                 else:
                     lr_2x.add(n)
-            elif ("time_faaaa" in n) and (args.layerwise_lr > 0):
-                if args.my_pile_stage == 2:
-                    lr_2x.add(n)
-                else:
-                    lr_1x.add(n)
-            elif ("time_first" in n) and (args.layerwise_lr > 0):
-                lr_3x.add(n)
             elif (
                 (len(p.squeeze().shape) >= 2)
-                and (args.weight_decay > 0)
+                and (weight_decay > 0)
                 and (".weight" in n)
             ):
                 lr_decay.add(n)
@@ -337,120 +333,55 @@ class RWKV(nn.Module):
         lr_2x = sorted(list(lr_2x))
         lr_3x = sorted(list(lr_3x))
 
-        if self.trainer.is_global_zero:
-            print("decay", lr_decay, "\n")
-            print("1x", lr_1x, "\n")
-            print("2x", lr_2x, "\n")
-            print("3x", lr_3x, "\n")
-
         param_dict = {n: p for n, p in self.named_parameters()}
 
-        if args.layerwise_lr > 0:
-            if args.my_pile_stage == 2:
-                optim_groups = [
-                    {
-                        "params": [param_dict[n] for n in lr_1x],
-                        "weight_decay": 0.0,
-                        "my_lr_scale": 1.0,
-                    },
-                    {
-                        "params": [param_dict[n] for n in lr_2x],
-                        "weight_decay": 0.0,
-                        "my_lr_scale": 5.0,
-                    },  # test: 2e-3 / args.lr_init},
-                    {
-                        "params": [param_dict[n] for n in lr_3x],
-                        "weight_decay": 0.0,
-                        "my_lr_scale": 5.0,
-                    },  # test: 3e-3 / args.lr_init},
-                ]
-            else:
-                optim_groups = [
-                    {
-                        "params": [param_dict[n] for n in lr_1x],
-                        "weight_decay": 0.0,
-                        "my_lr_scale": 1.0,
-                    },
-                    {
-                        "params": [param_dict[n] for n in lr_2x],
-                        "weight_decay": 0.0,
-                        "my_lr_scale": 2.0,
-                    },
-                    {
-                        "params": [param_dict[n] for n in lr_3x],
-                        "weight_decay": 0.0,
-                        "my_lr_scale": 3.0,
-                    },
-                ]
+        if layerwise_lr:
+            optim_groups = [
+                {
+                    "params": [param_dict[n] for n in lr_1x],
+                    "weight_decay": 0.0,
+                    "lr_scale": 1.0,
+                },
+                {
+                    "params": [param_dict[n] for n in lr_2x],
+                    "weight_decay": 0.0,
+                    "lr_scale": 5.0 if ft else 2.0,
+                },  # test: 2e-3 / lr_init},
+                {
+                    "params": [param_dict[n] for n in lr_3x],
+                    "weight_decay": 0.0,
+                    "lr_scale": 5.0 if ft else 3.0,
+                },  # test: 3e-3 / lr_init},
+            ]
         else:
             optim_groups = [
                 {
                     "params": [param_dict[n] for n in lr_1x],
                     "weight_decay": 0.0,
-                    "my_lr_scale": 1.0,
+                    "lr_scale": 1.0,
                 }
             ]
 
-        if args.weight_decay > 0:
+        if weight_decay > 0:
             optim_groups += [
                 {
                     "params": [param_dict[n] for n in lr_decay],
-                    "weight_decay": args.weight_decay,
-                    "my_lr_scale": 1.0,
+                    "weight_decay": weight_decay,
+                    "lr_scale": 1.0,
                 }
             ]
-            if self.deepspeed_offload:
-                return DeepSpeedCPUAdam(
-                    optim_groups,
-                    lr=args.lr_init,
-                    betas=args.betas,
-                    eps=args.adam_eps,
-                    bias_correction=True,
-                    adamw_mode=True,
-                    amsgrad=False,
-                )
-            return FusedAdam(
-                optim_groups,
-                lr=args.lr_init,
-                betas=args.betas,
-                eps=args.adam_eps,
-                bias_correction=True,
-                adam_w_mode=True,
-                amsgrad=False,
-            )
-        else:
-            if self.deepspeed_offload:
-                return DeepSpeedCPUAdam(
-                    optim_groups,
-                    lr=args.lr_init,
-                    betas=args.betas,
-                    eps=args.adam_eps,
-                    bias_correction=True,
-                    adamw_mode=False,
-                    weight_decay=0,
-                    amsgrad=False,
-                )
-            return FusedAdam(
-                optim_groups,
-                lr=args.lr_init,
-                betas=args.betas,
-                eps=args.adam_eps,
-                bias_correction=True,
-                adam_w_mode=False,
-                weight_decay=0,
-                amsgrad=False,
-            )
-        # return ZeroOneAdam(optim_groups, lr=args.lr_init, betas=args.betas, eps=args.adam_eps, bias_correction=True, weight_decay=0, amsgrad=False, cuda_aware=False)
+        return (DeepSpeedCPUAdam if cpu_adam else FusedAdam)(
+            optim_groups,
+            lr=lr_init,
+            betas=betas,
+            eps=adam_eps,
+            bias_correction=True,
+            adam_w_mode=False,
+            weight_decay=0,
+            amsgrad=False,
+        )
 
-    @property
-    def deepspeed_offload(self) -> bool:
-        strategy = self.trainer.strategy
-        if isinstance(strategy, DeepSpeedStrategy):
-            cfg = strategy.config["zero_optimization"]
-            return cfg.get("offload_optimizer") or cfg.get("offload_param")
-        return False
-
-    def forward(self, idx: torch.Tensor, deepspeed_checkpoint=False):
+    def forward(self, idx: torch.Tensor, checkpointing: bool):
         B, T = idx.size()
         assert T <= self.ctx_len, "Cannot forward, model ctx_len is exhausted."
 
@@ -460,9 +391,7 @@ class RWKV(nn.Module):
             x = self.drop0(x)
         v_first = torch.empty_like(x)
         for block in self.blocks:
-            if deepspeed_checkpoint:
-                import deepspeed
-
+            if checkpointing:
                 x, v_first = deepspeed.checkpointing.checkpoint(block, x, v_first)
             else:
                 x, v_first = block(x, v_first)
@@ -481,121 +410,9 @@ class RWKV(nn.Module):
 
         return x
 
-    def training_step(self, batch, batch_idx):
-        if args.my_qa_mask != 1:
-            idx, targets = batch
-            logits = self(idx)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-        else:
-            idx, targets, mask = batch
-            mask = mask.view(-1)
-            sum_mask = torch.sum(mask).item()
-            # if sum_mask == 0:
-            #     return torch.tensor([0.0], requires_grad=True)
-
-            logits = self(idx)
-            if sum_mask == mask.shape[0]:
-                loss = F.cross_entropy(
-                    logits.view(-1, logits.size(-1)), targets.view(-1)
-                )
-                # print('rank', self.global_rank, 'loss', loss.item())
-            else:
-                loss = F.cross_entropy(
-                    logits.view(-1, logits.size(-1)), targets.view(-1), reduction="none"
-                )
-                # loss_raw = loss
-                loss = torch.sum(loss * mask) / sum_mask
-
-                # torch.set_printoptions(threshold=10000)
-                # if True: #self.global_rank == 1:
-                #     tmp = ''
-                #     sss = 0
-                #     ccc = 0
-                #     for i in range(mask.shape[0]):
-                #         if mask[i] > 0:
-                #             tmp += str(idx.view(-1)[i].item()) + ','
-                #             sss += loss_raw.view(-1)[i].float().item()
-                #             ccc += 1
-                #     print('rank', self.global_rank, 'loss', loss.item(), 'lavg', sss / ccc)#, 'tmp', tmp, 'input', idx)
-
+    def training_step(
+        self, idx: torch.Tensor, targets: torch.Tensor, checkpointing: bool
+    ):
+        logits = self(idx, checkpointing)
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         return L2Wrap.apply(loss, logits)
-
-    def training_step_end(self, batch_parts):
-        if pl.__version__[0] != "2":
-            all = self.all_gather(batch_parts)
-            if self.trainer.is_global_zero:
-                self.trainer.my_loss_all = all
-
-    def reset_parameters(self):
-        nn.init.uniform_(self.emb.weight, a=-1e-4, b=1e-4)
-        if self.vocab_size > self.n_embd:
-            scale = 0.5 * math.sqrt(self.vocab_size / self.n_embd)
-        else:
-            scale = 0.5
-        nn.init.orthogonal_(self.head.weight, gain=scale)
-
-    def generate_init_weight(self):
-        m = {}
-        for n in self.state_dict():
-            p = self.state_dict()[n]
-            shape = p.shape
-            if (
-                "ln_" in n
-                or ".ln" in n
-                or "time_" in n
-                or "_mask" in n
-                or "pos_emb" in n
-                or ".mask." in n
-                or n.endswith("_w")
-                or n.endswith("_w1")
-                or n.endswith("_w2")
-                or n.endswith("_bias")
-                or (".weight" not in n)
-            ):
-                if "ln_x.weight" in n:
-                    layer_scale = (1 + int(n.split(".")[1])) / args.n_layer
-                    m[n] = (p * 0.0) + (layer_scale**0.7)
-                else:
-                    m[n] = p
-                print(n, "Init")
-            elif n in ["emb.weight", "head.weight"]:
-                pass
-            else:
-                scale = 0.0
-                assert n.endswith(".weight")  # should always be true
-
-                zero = [
-                    ".att.output.",
-                    ".ffn.value.",
-                    ".ffn.receptance.",
-                    ".ffnPre.value.",
-                    ".ffnPre.receptance.",
-                    "head_q.",
-                    ".oo.",
-                    ".rr.",
-                ]
-
-                for kk in zero:
-                    if kk in n:
-                        scale = 0
-                if "head_k." in n:
-                    scale = 0.1
-                if "head_q." in n:
-                    scale = 0
-
-                for kk in [".att.key."]:
-                    if kk in n:
-                        scale = 0.1
-                for kk in [".att.gate."]:
-                    if kk in n:
-                        scale = 0.1
-
-                print(f" [scale {scale}]")
-
-                m[n] = torch.empty((shape[0], shape[1]))
-
-                if scale == 0:
-                    nn.init.zeros_(m[n])
-                elif scale < 0:
-                    nn.init.uniform_(m[n], a=scale, b=-scale)
-        return m
