@@ -1,0 +1,22 @@
+[project]
+name = "nicole-llm"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "datasets>=3.3.2",
+    "deepspeed>=0.16.4",
+    "flash-attn>=2.7.4.post1",
+    "liger-kernel",
+    "transformers[torch]>=4.49.0",
+    "trl>=0.15.2",
+]
+
+[dependency-groups]
+dev = [
+    "black>=25.1.0",
+]
+
+[tool.uv.sources]
+liger-kernel = { git = "https://github.com/linkedin/Liger-Kernel" }
