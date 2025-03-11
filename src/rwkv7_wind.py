@@ -2,7 +2,7 @@ import torch
 from torch.utils.cpp_extension import load
 from pathlib import Path
 
-csrc = Path(__file__).parent / "csrc"
+csrc = Path(__file__).parent.parent / "csrc"
 CHUNK_LEN = 16
 
 
@@ -11,7 +11,6 @@ def load_cuda_rwkv7_g(head_size_a=64):
         name="rwkv7_wind_backstepping",
         sources=[csrc.joinpath("wkv7_op.cpp"), csrc.joinpath("wkv7_op.cu")],
         is_python_module=False,
-        verbose=True,
         extra_cuda_cflags=[
             "-res-usage",
             f"-D_C_={head_size_a}",

@@ -113,7 +113,9 @@ class RWKV7TMix(nn.Module):
             # self.value.weight.data.uniform_(-0.5/(C**0.5), 0.5/(C**0.5))
             self.output.weight.data.zero_()
             layer_scale = (1 + layer_id) / n_layer
-            self.ln_x.weight = (self.ln_x.weight * 0.0) + (layer_scale**0.7)
+            self.ln_x.weight = nn.Parameter(
+                (self.ln_x.weight * 0.0) + (layer_scale**0.7)
+            )
 
     def forward(self, x: torch.Tensor, v_first: torch.Tensor):
         B, T, C = x.size()
@@ -243,7 +245,7 @@ class L2Wrap(torch.autograd.Function):
         return (grad_output, gy)
 
 
-class RWKV(nn.Module):
+class RWKV7(nn.Module):
     def __init__(
         self,
         n_layer: int,
@@ -279,13 +281,13 @@ class RWKV(nn.Module):
         self.head = nn.Linear(n_embd, vocab_size, bias=False)
         self.vocab_size = vocab_size
         self.head_qk = head_qk
-        if head_qk > 0:
+        if head_qk:
             self.head_q = nn.Linear(n_embd, head_qk, bias=False)
             nn.init.zeros_(self.head_q.weight)
             self.head_k = nn.Linear(n_embd, head_qk, bias=False)
             nn.init.uniform_(self.head_q.weight, a=-0.1, b=0.1)
             self.register_buffer("copy_mask", torch.tril(torch.ones(ctx_len, ctx_len)))
-        if dropout > 0:
+        if dropout:
             self.drop0 = nn.Dropout(p=dropout)
         else:
             self.drop0 = None
@@ -370,16 +372,22 @@ class RWKV(nn.Module):
                     "lr_scale": 1.0,
                 }
             ]
-        return (DeepSpeedCPUAdam if cpu_adam else FusedAdam)(
-            optim_groups,
-            lr=lr_init,
-            betas=betas,
-            eps=adam_eps,
-            bias_correction=True,
-            adam_w_mode=False,
-            weight_decay=0,
-            amsgrad=False,
-        )
+        cls = DeepSpeedCPUAdam if cpu_adam else FusedAdam
+        dep = {"adamw_mode": True} if cpu_adam else {"adam_w_mode": True}
+        return [
+            cls(
+                group["params"],
+                lr=lr_init * group["lr_scale"],
+                betas=betas,
+                eps=adam_eps,
+                bias_correction=True,
+                weight_decay=group["weight_decay"],
+                amsgrad=False,
+                **dep,
+            )
+            for group in optim_groups
+            if len(group["params"]) > 0
+        ]
 
     def forward(self, idx: torch.Tensor, checkpointing: bool):
         B, T = idx.size()
@@ -398,7 +406,7 @@ class RWKV(nn.Module):
 
         x = self.ln_out(x)
 
-        if self.head_qk > 0:
+        if self.head_qk:
             q = self.head_q(x)[:, :T, :]
             k = self.head_k(x)[:, :T, :]
             c = (q @ k.transpose(-2, -1)) * (1.0 / self.head_qk)
