@@ -12,6 +12,7 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.set_float32_matmul_precision("high")
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
+torch.backends.cudnn.benchmark = True
 
 from src.llama import LlamaModel
 
