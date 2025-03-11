@@ -25,8 +25,8 @@ def train_model():
         "HuggingFaceFW/fineweb-edu", data_files="sample/10BT/000_00000.parquet"
     )["train"]
     vocab_size = len(tokenizer)
-    dim = 1024
-    n_layers = 16
+    dim = 512
+    n_layers = 6
     n_heads = 16
     max_seq_len = 1024
     learning_rate = 1e-3
