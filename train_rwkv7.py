@@ -103,15 +103,18 @@ def train_model():
             schedule.step()
         pbar.set_description(f"Train: {loss.item():.4f}")
     print(f"{steps}steps done in {time.time() - now}s")
+    torch.save(model.state_dict(), "./store/rwkv7.pt")
     print("Generating text from trained model:")
     model.eval()
     with torch.inference_mode():
         start_text = "Hello"
-        start_tokens = tokenizer.encode(start_text, return_tensors="pt").to(device)
-        generated_ids = model.generate(
+        start_tokens = (
+            tokenizer.encode(start_text, return_tensors="pt").to(device).squeeze()
+        )
+        generated_ids = model.inference(
             start_tokens, max_new_tokens=15, temperature=0.7, top_k=40
         )
-        generated_text = tokenizer.decode(generated_ids[0])
+        generated_text = tokenizer.decode(generated_ids)
         print(f"Generated: {generated_text}")
 
 

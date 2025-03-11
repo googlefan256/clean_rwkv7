@@ -4,6 +4,7 @@ from pathlib import Path
 
 csrc = Path(__file__).parent.parent / "csrc"
 CHUNK_LEN = 16
+cuda_rwkv7_g_dtype = torch.bfloat16
 
 
 def load_cuda_rwkv7_g(head_size_a=64):
@@ -36,8 +37,10 @@ def load_cuda_rwkv7_g(head_size_a=64):
         ):
             B, T, H, C = w.shape
             assert T % CHUNK_LEN == 0
-            assert all(i.dtype == torch.bfloat16 for i in [w, q, k, v, z, b])
-            assert all(i.is_contiguous() for i in [w, q, k, v, z, b])
+            assert all(
+                i.dtype == cuda_rwkv7_g_dtype and i.is_contiguous()
+                for i in [w, q, k, v, z, b]
+            )
             y = torch.empty_like(v)
             s = torch.empty(
                 B, H, T // CHUNK_LEN, C, C, dtype=torch.float32, device=w.device
@@ -49,8 +52,9 @@ def load_cuda_rwkv7_g(head_size_a=64):
 
         @staticmethod
         def backward(ctx, dy: torch.Tensor):
-            assert all(i.dtype == torch.bfloat16 for i in [dy])
-            assert all(i.is_contiguous() for i in [dy])
+            assert all(
+                i.dtype == cuda_rwkv7_g_dtype and i.is_contiguous() for i in [dy]
+            )
             w, q, k, v, z, b, s, sa = ctx.saved_tensors
             dw, dq, dk, dv, dz, db = [torch.empty_like(x) for x in [w, q, k, v, z, b]]
             op.backward(w, q, k, v, z, b, dy, s, sa, dw, dq, dk, dv, dz, db)
@@ -63,7 +67,7 @@ def load_cuda_rwkv7_g(head_size_a=64):
         v: torch.Tensor,
         a: torch.Tensor,
         b: torch.Tensor,
-    ):
+    ) -> torch.Tensor:
         B, T, HC = q.shape
         q, w, k, v, a, b = [i.view(B, T, HC // 64, 64) for i in [q, w, k, v, a, b]]
         return WindBackstepping.apply(w, q, k, v, a, b).view(B, T, HC)

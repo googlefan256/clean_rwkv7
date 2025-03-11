@@ -1,9 +1,10 @@
 import math
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 import torch
 from torch import nn
 from torch.nn import functional as F
 from .rwkv7_wind import load_cuda_rwkv7_g
+from .wkv7s_infer import load_cuda_rwkv7_op, cuda_rwkv7_op_dtype
 from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
 import deepspeed
 
@@ -21,7 +22,9 @@ class RWKV7TMix(nn.Module):
         super().__init__()
         self.layer_id = layer_id
         self.cuda_rwkv7_g = load_cuda_rwkv7_g(head_size_a)
+        self.cuda_rwkv7 = load_cuda_rwkv7_op(head_size_a)
         self.n_head = dim_att // head_size_a
+        self.head_size = head_size_a
         assert dim_att % self.n_head == 0
         H = self.n_head
         N = head_size_a
@@ -131,20 +134,20 @@ class RWKV7TMix(nn.Module):
 
         r = self.receptance(xr)
         w = (
-            -F.softplus(-(self.w0 + torch.tanh(xw @ self.w1) @ self.w2)) - 0.5
+            -F.softplus(-(self.w0 + F.tanh(xw @ self.w1) @ self.w2)) - 0.5
         )  # soft-clamp to (-inf, -0.5)
         k = self.key(xk)
         v = self.value(xv)
         if self.layer_id == 0:
             v_first = v  # store the v of the first layer
         else:
-            v = v + (v_first - v) * torch.sigmoid(
+            v = v + (v_first - v) * F.sigmoid(
                 self.v0 + (xv @ self.v1) @ self.v2
             )  # add value residual
-        a = torch.sigmoid(
+        a = F.sigmoid(
             self.a0 + (xa @ self.a1) @ self.a2
         )  # a is "in-context learning rate"
-        g = torch.sigmoid(xg @ self.g1) @ self.g2
+        g = F.sigmoid(xg @ self.g1) @ self.g2
 
         kk = k * self.k_k
         kk = F.normalize(kk.view(B, T, H, -1), dim=-1, p=2.0).view(B, T, C)
@@ -161,6 +164,101 @@ class RWKV7TMix(nn.Module):
         ).view(B, T, C)
         x = self.output(x * g)
         return x, v_first
+
+    def inference_single(
+        self,
+        x: torch.Tensor,
+        x_prev: torch.Tensor,
+        v_first: torch.Tensor,
+        state: torch.Tensor,
+    ):
+        H, N = self.n_head, self.head_size
+        xx = x_prev - x
+        xr, xw, xk, xv, xa, xg = (
+            x + xx * self.x_r.squeeze(),
+            x + xx * self.x_w.squeeze(),
+            x + xx * self.x_k.squeeze(),
+            x + xx * self.x_v.squeeze(),
+            x + xx * self.x_a.squeeze(),
+            x + xx * self.x_g.squeeze(),
+        )
+        r = xr @ self.receptance.weight.t()
+        w = F.tanh(xw @ self.w1) @ self.w2
+        k = self.key(xk)
+        v = self.value(xv)
+        a = F.sigmoid(self.a0 + (xa @ self.a1) @ self.a2)
+        g = F.sigmoid(xg @ self.g1) @ self.g2
+
+        kk = F.normalize((k * self.k_k).view(H, N), dim=-1, p=2.0).view(H * N)
+        k = k * (1 + (a - 1) * self.k_a)
+        if self.layer_id == 0:
+            v_first = v
+        else:
+            v = v + (v_first - v) * F.sigmoid(self.v0 + (xv @ self.v1) @ self.v2)
+        w = torch.exp(-0.606531 * F.sigmoid((self.w0 + w)))  # 0.606531 = exp(-0.5)
+
+        vk = v.view(H, N, 1) @ k.view(H, 1, N)
+        ab = (-kk).view(H, N, 1) @ (kk * a).view(H, 1, N)
+        state = state * w.view(H, 1, N) + state @ ab + vk
+        xx = state.to(dtype=x.dtype) @ r.view(H, N, 1)
+
+        xx = self.ln_x(xx.view(1, H * N)).view(H * N)
+        xx = xx + (
+            (r * k * self.r_k.flatten()).view(H, N).sum(dim=-1, keepdim=True)
+            * v.view(H, N)
+        ).view(H * N)
+        return (xx * g) @ self.output.weight.t(), x, state, v_first
+
+    def inference_multiple(
+        self,
+        x: torch.Tensor,
+        x_prev: torch.Tensor,
+        v_first: torch.Tensor,
+        state: torch.Tensor,
+    ):
+        H, N = self.n_head, self.head_size
+        T = x.shape[0]
+        xx = torch.cat((x_prev.unsqueeze(0), x[:-1, :])) - x
+        xr, xw, xk, xv, xa, xg = (
+            x + xx * self.x_r.squeeze(),
+            x + xx * self.x_w.squeeze(),
+            x + xx * self.x_k.squeeze(),
+            x + xx * self.x_v.squeeze(),
+            x + xx * self.x_a.squeeze(),
+            x + xx * self.x_g.squeeze(),
+        )
+
+        r = xr @ self.receptance.weight.t()
+        w = F.tanh(xw @ self.w1) @ self.w2
+        k = self.key(xk)
+        v = self.value(xv)
+        a = F.sigmoid(self.a0 + (xa @ self.a1) @ self.a2)
+        g = F.sigmoid(xg @ self.g1) @ self.g2
+
+        kk = F.normalize((k * self.k_k).view(T, H, N), dim=-1, p=2.0).view(T, H * N)
+        k = k * (1 + (a - 1) * self.k_a)
+        if self.layer_id == 0:
+            v_first = v
+        else:
+            v = v + (v_first - v) * F.sigmoid(self.v0 + (xv @ self.v1) @ self.v2)
+
+        ######## cuda-free method
+        # w = torch.exp(-0.606531 * F.sigmoid((w0 + w).float())) # 0.606531 = exp(-0.5)
+        # for t in range(T):
+        #     r_, w_, k_, v_, kk_, a_ = r[t], w[t], k[t], v[t], kk[t], a[t]
+        #     vk = v_.view(H,N,1) @ k_.view(H,1,N)
+        #     ab = (-kk_).view(H,N,1) @ (kk_*a_).view(H,1,N)
+        #     state = state * w_.view(H,1,N) + state @ ab.float() + vk.float()
+        #     xx[t] = (state.to(dtype=x.dtype) @ r_.view(H,N,1)).view(H*N)
+        w = -F.softplus(-(self.w0 + w)) - 0.5
+        xx = self.cuda_rwkv7(state.float(), r, w, k, v, -kk, kk * a)
+
+        xx = self.ln_x(xx.view(T, H * N)).view(T, H * N)
+        xx = xx + (
+            (r * k * self.r_k.flatten()).view(T, H, N).sum(dim=-1, keepdim=True)
+            * v.view(T, H, N)
+        ).view(T, H * N)
+        return (xx * g) @ self.output.weight.t(), x[-1, :], state, v_first
 
 
 class RWKV7CMix(nn.Module):
@@ -185,11 +283,21 @@ class RWKV7CMix(nn.Module):
 
     def forward(self, x: torch.Tensor):
         xx = self.time_shift(x) - x
-
         k = x + xx * self.x_k
         k = F.relu(self.key(k)) ** 2
-
         return self.value(k)
+
+    def inference_single(self, x: torch.Tensor, x_prev: torch.Tensor):
+        xx = x_prev - x
+        k = x + xx * self.x_k.squeeze()
+        k = F.relu(k @ self.key.weight.t()) ** 2
+        return k @ self.value.weight.t(), x
+
+    def inference_multiple(self, x: torch.Tensor, x_prev: torch.Tensor):
+        xx = torch.cat((x_prev.unsqueeze(0), x[:-1, :])) - x
+        k = x + xx * self.x_k.squeeze()
+        k = F.relu(k @ self.key.weight.t()) ** 2
+        return k @ self.value.weight.t(), x[-1, :]
 
 
 class Block(nn.Module):
@@ -276,7 +384,8 @@ class RWKV7(nn.Module):
                 for i in range(n_layer)
             ]
         )
-
+        self.head_size = head_size_a
+        self.n_embd = n_embd
         self.ln_out = nn.LayerNorm(n_embd)
         self.head = nn.Linear(n_embd, vocab_size, bias=False)
         self.vocab_size = vocab_size
@@ -424,3 +533,138 @@ class RWKV7(nn.Module):
         logits = self(idx, checkpointing)
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         return L2Wrap.apply(loss, logits)
+
+    @torch.inference_mode()
+    def inference(
+        self,
+        x: torch.Tensor,
+        max_new_tokens=16,
+        temperature=1.0,
+        top_p=1.0,
+        top_k=0,
+        eos=-1,
+    ):
+        state = [None for _ in range(len(self.blocks) * 3)]
+        for i in range(len(self.blocks)):  # state: 0=att_x_prev 1=att_kv 2=ffn_x_prev
+            state[i * 3 + 0] = torch.zeros(
+                self.n_embd,
+                dtype=cuda_rwkv7_op_dtype,
+                requires_grad=False,
+                device=x.device,
+            )
+            state[i * 3 + 1] = torch.zeros(
+                (self.n_embd // self.head_size, self.head_size, self.head_size),
+                dtype=cuda_rwkv7_op_dtype,
+                requires_grad=False,
+                device=x.device,
+            )
+            state[i * 3 + 2] = torch.zeros(
+                self.n_embd,
+                dtype=cuda_rwkv7_op_dtype,
+                requires_grad=False,
+                device=x.device,
+            )
+        tokens = []
+        for _ in range(max_new_tokens):
+            logits, state = self.inference_step(x, state)
+            x = self.sample(logits, temperature, top_p, top_k)
+            tokens.append(x.item())
+            if x.item() == eos:
+                break
+        return tokens
+
+    def sample(
+        self, logits: torch.Tensor, temperature: float, top_p: float, top_k: int
+    ):
+        probs = F.softmax(logits.squeeze().float(), dim=-1)
+        sorted_probs, sorted_ids = torch.sort(probs, descending=True)
+
+        if top_k > 0:
+            probs[sorted_ids[top_k:]] = 0
+
+        if top_p < 1:
+            cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+            cutoff_index = torch.searchsorted(cumulative_probs, top_p)
+            cutoff = sorted_probs[cutoff_index]
+            probs[probs < cutoff] = 0
+
+            if top_p > 0:
+                idx = torch.where(probs == cutoff)[0]
+                if len(idx) > 0:
+                    probs[idx] = cutoff + (top_p - torch.sum(probs).item()) / len(idx)
+                    # assert abs(torch.sum(probs).item() - top_p) < 1e-6
+        if temperature != 1.0:
+            probs = probs ** (1.0 / temperature)
+        return torch.multinomial(probs, num_samples=1)
+
+    def inference_step(self, x: torch.Tensor, state: List[torch.Tensor]):
+        if x.numel() > 1:
+            return self.inference_step_multiple(x, state)
+        else:
+            return self.inference_step_single(x.squeeze(), state)
+
+    def inference_step_single(self, x: torch.Tensor, state: List[torch.Tensor]):
+        x = self.emb(x)
+        v_first = torch.empty_like(x)
+        for block in self.blocks:
+            if block.layer_id == 0:
+                x = block.ln0(x)
+            xx = block.ln1(x)
+
+            (
+                xx,
+                state[block.layer_id * 3 + 0],
+                state[block.layer_id * 3 + 1],
+                v_first,
+            ) = block.att.inference_single(
+                xx,
+                state[block.layer_id * 3 + 0],
+                v_first,
+                state[block.layer_id * 3 + 1],
+            )
+            x = x + xx
+
+            xx = block.ln2(x)
+
+            xx, state[block.layer_id * 3 + 2] = block.ffn.inference_single(
+                xx,
+                state[block.layer_id * 3 + 2],
+            )
+            x = x + xx
+
+        x = self.ln_out(x)
+        x = x @ self.head.weight.t()
+        return x, state
+
+    def inference_step_multiple(self, x: torch.Tensor, state: List[torch.Tensor]):
+        x = self.emb(x)
+        v_first = torch.empty_like(x)
+        for block in self.blocks:
+            if block.layer_id == 0:
+                x = block.ln0(x)
+            xx = block.ln1(x)
+
+            (
+                xx,
+                state[block.layer_id * 3 + 0],
+                state[block.layer_id * 3 + 1],
+                v_first,
+            ) = block.att.inference_multiple(
+                xx,
+                state[block.layer_id * 3 + 0],
+                v_first,
+                state[block.layer_id * 3 + 1],
+            )
+            x = x + xx
+
+            xx = block.ln2(x)
+
+            xx, state[block.layer_id * 3 + 2] = block.ffn.inference_multiple(
+                xx,
+                state[block.layer_id * 3 + 2],
+            )
+            x = x + xx
+
+        x = self.ln_out(x)
+        x = x @ self.head.weight.t()
+        return x[-1], state
